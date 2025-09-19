@@ -1,0 +1,217 @@
+Job-1-amazon-prime-video
+
+pipeline {
+    agent any
+    tools {
+        jdk 'jdk'
+        nodejs 'node17'
+    }
+    environment {
+        SCANNER_HOME=tool 'sonar-scanner'
+    }
+    stages {
+        stage('Clean WS') {
+            steps{
+                cleanWs()
+            }
+        }
+        stage('Checkout') {
+            steps {
+                git branch: 'main', url: 'https://github.com/nrjydv1997/amazon-prime-video-kubernetes.git'
+            }
+        }
+        
+        stage('Sonar Analysis'){
+            steps{
+                withSonarQubeEnv('SonarQube') {
+                    sh ''' $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=amazon-prime-video -Dsonar.projectKey=amazon-prime-video '''
+                }
+            }
+        }
+        stage("Quality gate"){
+            steps{
+                script{
+                    waitForQualityGate abortPipeline: false, credentialsId: 'Sonar-token'
+                }
+            }
+        }
+        stage("Install Dependencies"){
+            steps{
+                sh "npm install"
+            }
+        }
+        stage("Trivy Scan"){
+            steps{
+                sh "trivy fs . > trivyfs.txt"
+            }
+        }
+        stage("Docker Build & Push"){
+            steps{
+                script{
+                    withDockerRegistry(credentialsId: 'docker', toolName: 'docker') {
+                        sh "docker build -t amazon-prime-video ."
+                        sh "docker tag amazon-prime-video nrjydv1997/amazon-prime-video:latest"
+                        sh "docker push nrjydv1997/amazon-prime-video:latest"
+                    }
+                }
+            }
+        }
+        stage("Docker Scout Image"){
+            steps{
+                script{
+                    withDockerRegistry(credentialsId: 'docker', toolName: 'docker') {
+                        sh "docker-scout quickview nrjydv1997/amazon-prime-video:latest"
+                        sh "docker-scout cves nrjydv1997/amazon-prime-video:latest"
+                        sh "docker-scout recommendations nrjydv1997/amazon-prime-video:latest"
+                    }
+                }
+            }
+        }
+        stage("TRIVY-docker-images"){
+            steps{
+                sh "trivy image nrjydv1997/amazon-prime-video:latest > trivyimage.txt"
+            }
+        }
+        stage("App Deploy"){
+            steps{
+                sh "docker run -d --name amazon-prime-video -p 3000:3000 nrjydv1997/amazon-prime-video:latest"
+            }
+        }
+    }
+}
+
+-------------------------
+
+Job-2-cd-eks-deployment
+
+pipeline {
+    agent any
+
+    stages {
+        stage('Clean WS') {
+            steps {
+                cleanWs()
+            }
+        }
+        
+        stage('Checkout'){
+            steps{
+                git branch:'main',url: 'https://github.com/nrjydv1997/amazon-prime-video-kubernetes.git'
+            }
+        }
+        
+        stage('Deploy to EKS'){
+            steps{
+                dir('kubernetes'){
+                    script{
+                        sh '''
+                        echo "Verifying AWS credentials..."
+                        aws sts get-caller-identity
+                        
+                        echo "Configure kubectl for eks cluster..."
+                        aws eks update-kubeconfig --region ap-south-1 --name nrjydv
+                        
+                        echo "Verifying kubeconfig..."
+                        kubectl config view
+                        
+                        echo "Deploying application to EKS"
+                        kubectl apply -f manifest.yaml
+                        
+                        echo "Verifying deployment"
+                        kubectl get pods
+                        kubectl get svc
+                        '''
+                    }
+                }
+            }
+        }
+        
+    }
+}
+
+-------------------------------------------
+Job-3-monitoring server 
+
+pipeline {
+    agent any
+    
+    environment {
+        AWS_ACCESS_KEY_ID     = credentials('AWS_ACCESS_KEY_ID')
+        AWS_SECRET_ACCESS_KEY = credentials('AWS_SECRET_ACCESS_KEY')
+    }
+    
+    parameters {
+        string(name: 'action', defaultValue: 'apply', description: 'terraform action: apply or destroy')
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                git branch:'main',url: 'https://github.com/nrjydv1997/amazon-prime-video-kubernetes.git'
+            }
+        }
+        
+        stage('Tf Version') {
+            steps{
+                dir('terraform'){
+                    sh '''
+                    terraform --version
+                    '''
+                }
+            }
+        }
+        
+        stage('Tf init'){
+            steps{
+                dir('terraform'){
+                    sh '''
+                    terraform init \
+                    -backend-config="access_key=$AWS_ACCESS_KEY_ID" \
+                    -backend-config="secret_key=$AWS_SECRET_ACCESS_KEY"
+                    '''
+                }
+            }
+        }
+        
+        stage('Tf validate'){
+            steps{
+                dir('terraform'){
+                    sh 'terraform validate'
+                }
+            }
+        }
+        
+        stage('terraform plan'){
+            steps{
+                dir('terraform'){
+                    sh '''
+                    terraform plan \
+                    -var="access_key=$AWS_ACCESS_KEY_ID" \
+                    -var="secret_key=$AWS_SECRET_ACCESS_KEY"
+                    '''
+                }
+            }
+        }
+        
+        stage('Tf apply/destroy'){
+            steps{
+                dir('terraform'){
+                    sh '''
+                    terraform ${action} --auto-approve \
+                    -var="access_key=$AWS_ACCESS_KEY_ID" \
+                    -var="secret_key=$AWS_SECRET_ACCESS_KEY"
+                    '''
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            echo 'Terraform execution completed successfully!'
+        }
+        failure {
+            echo 'Terraform execution failed! Check the logs.'
+        }
+    }
+}
